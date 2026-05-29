@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 import re
+import threading
 import time
 
 import pymysql
@@ -35,6 +36,8 @@ POINTS = [
 ]
 
 POINT_BY_ADDRESS = {point["address"]: point for point in POINTS}
+LOOP_THREAD = None
+LOOP_STOP_EVENT = threading.Event()
 
 
 def _empty_result(msg):
@@ -229,14 +232,50 @@ def _collect_all(device_id):
         client.close()
 
 
-def _collect_loop(device_id, interval_seconds):
+def _collect_loop_worker(device_id, interval_seconds):
     round_no = 0
     print("PLC循环采集启动，间隔{}秒".format(interval_seconds))
-    while True:
+    while not LOOP_STOP_EVENT.is_set():
         round_no += 1
         result = _collect_all(device_id)
         print("PLC循环采集第{}轮: {}".format(round_no, result.get("msg")))
-        time.sleep(interval_seconds)
+        LOOP_STOP_EVENT.wait(interval_seconds)
+    print("PLC循环采集停止")
+
+
+def _start_collect_loop(device_id, interval_seconds):
+    global LOOP_THREAD
+    if LOOP_THREAD is not None and LOOP_THREAD.is_alive():
+        return {
+            "msg": "success",
+            "data": {
+                "value": "loop already running"
+            }
+        }
+
+    LOOP_STOP_EVENT.clear()
+    LOOP_THREAD = threading.Thread(
+        target=_collect_loop_worker,
+        args=(device_id, interval_seconds),
+        daemon=True
+    )
+    LOOP_THREAD.start()
+    return {
+        "msg": "success",
+        "data": {
+            "value": "loop started"
+        }
+    }
+
+
+def _stop_collect_loop():
+    LOOP_STOP_EVENT.set()
+    return {
+        "msg": "success",
+        "data": {
+            "value": "loop stopping"
+        }
+    }
 
 
 def query(data):
@@ -246,7 +285,8 @@ def query(data):
     data字典数据:
         addres/address: str PLC寄存器地址，如 "D2000" 或 "2000"
         index: str OPCUA_Read索引，如 "0" 表示 D2000；也兼容 "D2000"
-               传 "all" 表示采集一轮全部点位；传 "loop" 表示循环采集全部点位
+               传 "all" 表示采集一轮全部点位；传 "loop" 表示后台循环采集全部点位
+               传 "stop" 表示停止后台循环采集
         device_id: int Modbus从站ID，默认1
         interval: int 循环采集间隔秒数，默认5秒
         count: int 读取寄存器数量，默认1
@@ -265,7 +305,9 @@ def query(data):
             interval_seconds = _parse_int(data, "interval", LOOP_INTERVAL_SECONDS)
             if interval_seconds <= 0:
                 raise ValueError("interval 必须大于0")
-            return _collect_loop(device_id, interval_seconds)
+            return _start_collect_loop(device_id, interval_seconds)
+        if mode in ("stop", "halt"):
+            return _stop_collect_loop()
         if mode in ("all", "*"):
             return _collect_all(device_id)
 
