@@ -13,6 +13,7 @@ PLC_PORT = 502
 PLC_TIMEOUT = 3
 DEFAULT_DEVICE_ID = 1
 OPCUA_READ_BASE = 2000
+LOOP_INTERVAL_SECONDS = 5
 MYSQL_HOST = "127.0.0.1"
 MYSQL_PORT = 3306
 MYSQL_USER = "root"
@@ -100,8 +101,9 @@ def _init_mysql():
         conn.close()
 
 
-def _save_point(point, raw_value):
-    _init_mysql()
+def _save_point(point, raw_value, ensure_schema=True):
+    if ensure_schema:
+        _init_mysql()
     display_value = raw_value * point["scale"] if raw_value is not None else None
     conn = _mysql_conn(MYSQL_DATABASE)
     try:
@@ -201,6 +203,7 @@ def _read_register(client, register_addr, device_id):
 
 
 def _collect_all(device_id):
+    _init_mysql()
     client = ModbusTcpClient(host=PLC_IP, port=PLC_PORT, timeout=PLC_TIMEOUT)
     try:
         if not client.connect():
@@ -210,7 +213,7 @@ def _collect_all(device_id):
         for point in POINTS:
             register_addr = int(point["address"][1:])
             raw_value = _read_register(client, register_addr, device_id)
-            _save_point(point, raw_value)
+            _save_point(point, raw_value, ensure_schema=False)
             values[point["code"]] = raw_value * point["scale"]
             time.sleep(0.02)
 
@@ -226,6 +229,16 @@ def _collect_all(device_id):
         client.close()
 
 
+def _collect_loop(device_id, interval_seconds):
+    round_no = 0
+    print("PLC循环采集启动，间隔{}秒".format(interval_seconds))
+    while True:
+        round_no += 1
+        result = _collect_all(device_id)
+        print("PLC循环采集第{}轮: {}".format(round_no, result.get("msg")))
+        time.sleep(interval_seconds)
+
+
 def query(data):
     """
     query接口: 读取3号展板汇川PLC的Modbus TCP寄存器原始数据。
@@ -233,7 +246,9 @@ def query(data):
     data字典数据:
         addres/address: str PLC寄存器地址，如 "D2000" 或 "2000"
         index: str OPCUA_Read索引，如 "0" 表示 D2000；也兼容 "D2000"
+               传 "all" 表示采集一轮全部点位；传 "loop" 表示循环采集全部点位
         device_id: int Modbus从站ID，默认1
+        interval: int 循环采集间隔秒数，默认5秒
         count: int 读取寄存器数量，默认1
 
     返回数据:
@@ -245,7 +260,13 @@ def query(data):
     try:
         _, raw_address = _pick_address(data)
         device_id = _parse_int(data, "device_id", DEFAULT_DEVICE_ID)
-        if raw_address.strip().lower() in ("all", "*"):
+        mode = raw_address.strip().lower()
+        if mode in ("loop", "repeat", "auto"):
+            interval_seconds = _parse_int(data, "interval", LOOP_INTERVAL_SECONDS)
+            if interval_seconds <= 0:
+                raise ValueError("interval 必须大于0")
+            return _collect_loop(device_id, interval_seconds)
+        if mode in ("all", "*"):
             return _collect_all(device_id)
 
         register_addr, input_address = _parse_register_address(data)
