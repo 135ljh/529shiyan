@@ -17,8 +17,7 @@ def _empty_result(msg):
     return {
         "msg": msg,
         "data": {
-            "value": None,
-            "out_value": None
+            "value": None
         }
     }
 
@@ -76,7 +75,7 @@ def query(data):
         count: int 读取寄存器数量，默认1
 
     返回数据:
-        value/out_value: int|list 读取到的寄存器原始值
+        value: int|list 读取到的寄存器原始值
     """
     if data is None:
         data = {}
@@ -119,8 +118,7 @@ def query(data):
         return {
             "msg": "success",
             "data": {
-                "value": value,
-                "out_value": value
+                "value": value
             }
         }
 
