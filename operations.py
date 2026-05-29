@@ -1,7 +1,9 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 import re
+import time
 
+import pymysql
 from pymodbus.client import ModbusTcpClient
 from pymodbus.exceptions import ModbusException
 
@@ -11,6 +13,27 @@ PLC_PORT = 502
 PLC_TIMEOUT = 3
 DEFAULT_DEVICE_ID = 1
 OPCUA_READ_BASE = 2000
+MYSQL_HOST = "127.0.0.1"
+MYSQL_PORT = 3306
+MYSQL_USER = "root"
+MYSQL_PASSWORD = "123456"
+MYSQL_DATABASE = "plc_panel"
+
+POINTS = [
+    {"code": "voltage", "name": "电压", "address": "D2000", "scale": 0.1, "unit": "V"},
+    {"code": "current", "name": "电流", "address": "D2001", "scale": 0.01, "unit": "A"},
+    {"code": "power", "name": "瞬时有功功率", "address": "D2002", "scale": 1, "unit": "W"},
+    {"code": "frequency", "name": "频率", "address": "D2004", "scale": 0.01, "unit": "Hz"},
+    {"code": "electricity", "name": "总有功电能", "address": "D2005", "scale": 0.01, "unit": "kW.h"},
+    {"code": "water", "name": "总用水量", "address": "D2010", "scale": 0.01, "unit": "m3"},
+    {"code": "humidity", "name": "湿度", "address": "D2020", "scale": 0.1, "unit": "%RH"},
+    {"code": "temperature", "name": "温度", "address": "D2021", "scale": 0.1, "unit": "C"},
+    {"code": "noise", "name": "噪音", "address": "D2030", "scale": 1, "unit": "dB"},
+    {"code": "smoke", "name": "烟感状态", "address": "D2040", "scale": 1, "unit": "ppm"},
+    {"code": "rope", "name": "拉绳长度", "address": "D2060", "scale": 0.1, "unit": "mm"},
+]
+
+POINT_BY_ADDRESS = {point["address"]: point for point in POINTS}
 
 
 def _empty_result(msg):
@@ -20,6 +43,102 @@ def _empty_result(msg):
             "value": None
         }
     }
+
+
+def _mysql_conn(database=None):
+    return pymysql.connect(
+        host=MYSQL_HOST,
+        port=MYSQL_PORT,
+        user=MYSQL_USER,
+        password=MYSQL_PASSWORD,
+        database=database,
+        charset="utf8mb4",
+        autocommit=False
+    )
+
+
+def _init_mysql():
+    conn = _mysql_conn()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "CREATE DATABASE IF NOT EXISTS `{}` DEFAULT CHARACTER SET utf8mb4".format(MYSQL_DATABASE)
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    conn = _mysql_conn(MYSQL_DATABASE)
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS plc_realtime (
+                    point_code VARCHAR(64) PRIMARY KEY,
+                    point_name VARCHAR(128) NOT NULL,
+                    address VARCHAR(32) NOT NULL,
+                    raw_value BIGINT,
+                    display_value DOUBLE,
+                    unit VARCHAR(32),
+                    updated_at DATETIME NOT NULL
+                ) DEFAULT CHARSET=utf8mb4
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS plc_history (
+                    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+                    point_code VARCHAR(64) NOT NULL,
+                    point_name VARCHAR(128) NOT NULL,
+                    address VARCHAR(32) NOT NULL,
+                    raw_value BIGINT,
+                    display_value DOUBLE,
+                    unit VARCHAR(32),
+                    created_at DATETIME NOT NULL,
+                    INDEX idx_point_time (point_code, created_at)
+                ) DEFAULT CHARSET=utf8mb4
+            """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _save_point(point, raw_value):
+    _init_mysql()
+    display_value = raw_value * point["scale"] if raw_value is not None else None
+    conn = _mysql_conn(MYSQL_DATABASE)
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                REPLACE INTO plc_realtime
+                (point_code, point_name, address, raw_value, display_value, unit, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                """,
+                (
+                    point["code"],
+                    point["name"],
+                    point["address"],
+                    raw_value,
+                    display_value,
+                    point["unit"]
+                )
+            )
+            cursor.execute(
+                """
+                INSERT INTO plc_history
+                (point_code, point_name, address, raw_value, display_value, unit, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                """,
+                (
+                    point["code"],
+                    point["name"],
+                    point["address"],
+                    raw_value,
+                    display_value,
+                    point["unit"]
+                )
+            )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _pick_address(data):
@@ -64,6 +183,49 @@ def _parse_int(data, key, default_value):
         raise ValueError("{} 必须是整数".format(key))
 
 
+def _read_register(client, register_addr, device_id):
+    response = client.read_holding_registers(
+        address=register_addr,
+        count=1,
+        device_id=device_id
+    )
+
+    if isinstance(response, ModbusException):
+        raise RuntimeError("读取寄存器失败：{}".format(response))
+
+    if response.isError():
+        error_code = getattr(response, "exception_code", response)
+        raise RuntimeError("PLC返回错误，地址：D{}，错误码：{}".format(register_addr, error_code))
+
+    return response.registers[0]
+
+
+def _collect_all(device_id):
+    client = ModbusTcpClient(host=PLC_IP, port=PLC_PORT, timeout=PLC_TIMEOUT)
+    try:
+        if not client.connect():
+            return _empty_result("error: 无法连接到PLC，IP：{}，端口：{}".format(PLC_IP, PLC_PORT))
+
+        values = {}
+        for point in POINTS:
+            register_addr = int(point["address"][1:])
+            raw_value = _read_register(client, register_addr, device_id)
+            _save_point(point, raw_value)
+            values[point["code"]] = raw_value * point["scale"]
+            time.sleep(0.02)
+
+        return {
+            "msg": "success",
+            "data": {
+                "value": values
+            }
+        }
+    except Exception as exc:
+        return _empty_result("error: 批量采集异常：{}".format(exc))
+    finally:
+        client.close()
+
+
 def query(data):
     """
     query接口: 读取3号展板汇川PLC的Modbus TCP寄存器原始数据。
@@ -81,8 +243,12 @@ def query(data):
         data = {}
 
     try:
-        register_addr, input_address = _parse_register_address(data)
+        _, raw_address = _pick_address(data)
         device_id = _parse_int(data, "device_id", DEFAULT_DEVICE_ID)
+        if raw_address.strip().lower() in ("all", "*"):
+            return _collect_all(device_id)
+
+        register_addr, input_address = _parse_register_address(data)
         count = _parse_int(data, "count", 1)
         if count <= 0:
             raise ValueError("count 必须大于0")
@@ -114,6 +280,9 @@ def query(data):
 
         registers = response.registers
         value = registers[0] if count == 1 else registers
+        point = POINT_BY_ADDRESS.get("D{}".format(register_addr))
+        if point is not None and count == 1:
+            _save_point(point, value)
 
         return {
             "msg": "success",
