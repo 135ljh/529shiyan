@@ -15,6 +15,7 @@ PLC_TIMEOUT = 3
 DEFAULT_DEVICE_ID = 1
 OPCUA_READ_BASE = 2000
 LOOP_INTERVAL_SECONDS = 5
+HISTORY_RETENTION_HOURS = 24
 MYSQL_HOST = "127.0.0.1"
 MYSQL_PORT = 3306
 MYSQL_USER = "root"
@@ -146,6 +147,19 @@ def _save_point(point, raw_value, ensure_schema=True):
         conn.close()
 
 
+def _cleanup_history(retention_hours=HISTORY_RETENTION_HOURS):
+    conn = _mysql_conn(MYSQL_DATABASE)
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "DELETE FROM plc_history WHERE created_at < DATE_SUB(NOW(), INTERVAL %s HOUR)",
+                (retention_hours,)
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _pick_address(data):
     for key in ("addres", "address", "index"):
         value = data.get(key)
@@ -219,6 +233,7 @@ def _collect_all(device_id):
             _save_point(point, raw_value, ensure_schema=False)
             values[point["code"]] = raw_value * point["scale"]
             time.sleep(0.02)
+        _cleanup_history()
 
         return {
             "msg": "success",
@@ -346,6 +361,7 @@ def query(data):
         point = POINT_BY_ADDRESS.get("D{}".format(register_addr))
         if point is not None and count == 1:
             _save_point(point, value)
+            _cleanup_history()
 
         return {
             "msg": "success",
